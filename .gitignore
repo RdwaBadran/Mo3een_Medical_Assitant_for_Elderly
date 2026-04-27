@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Database files
+*.db
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# Environment variables
+.env
+
+# Logs and cache
+*.log
+*.txt
+.pytest_cache/
+__pycache__/
+
+# macOS
+.DS_Store

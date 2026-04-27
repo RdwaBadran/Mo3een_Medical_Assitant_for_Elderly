@@ -1,0 +1,253 @@
+# Multi-Session Chat History — Implementation Plan
+
+## Codebase Summary (What I Found)
+
+| Layer | File | Purpose |
+|---|---|---|
+| Entry point | [main.py](file:///f:/medical-agent/main.py) | FastAPI app, lifespan startup, CORS, serves `static/index.html` |
+| Routes | [routes.py](file:///f:/medical-agent/api/routes.py) | `POST /api/chat` (text) + `POST /api/lab-upload` (file). Uses `ChatRequest(query: str)` and `ChatResponse(response, tool_used)` |
+| Agent | [agent.py](file:///f:/medical-agent/agent/agent.py) | `run_agent(query: str)` builds `[HumanMessage(content=query)]` and calls `agent.invoke({"messages": [...]})`. No history today. |
+| Frontend | [index.html](file:///f:/medical-agent/static/index.html) | Single-file HTML (1013 lines). Dark theme, sidebar shows tool cards (not sessions). Chat bubbles with markdown rendering. |
+| Config | [.env](file:///f:/medical-agent/.env) | `GROQ_API_KEY`, `OPENAI_API_KEY`, `NCBI_API_KEY`, `ANONYMIZED_TELEMETRY` |
+| Deps | [requirements.txt](file:///f:/medical-agent/requirements.txt) | FastAPI, LangChain, Groq, etc. No SQLite dependency needed (it's in Python stdlib). |
+
+**Key observations:**
+- The current `/api/chat` is stateless — each request creates a fresh `[HumanMessage]` and sends it to the agent. No history is maintained.
+- `run_agent()` accepts a `query: str` and internally builds the `messages` list. This function needs a **new signature** to accept pre-built messages.
+- The sidebar currently shows only static tool cards (Symptoms, Drug, Lab). It needs to be restructured to also show session history.
+- SQLite is in Python's standard library — **no new pip dependency is needed**.
+
+---
+
+## Proposed Changes
+
+### Component 1: New Database Layer
+
+#### [NEW] [db.py](file:///f:/medical-agent/api/db.py)
+
+A standalone SQLite helper module with these functions:
+
+| Function | Signature | Description |
+|---|---|---|
+| `create_table_if_not_exists()` | `() → None` | Creates the `sessions` table on first run |
+| `create_session()` | `(user_id: str) → str` | Inserts a new row with UUID `thread_id`, empty `messages = "[]"`, null `session_name`. Returns `thread_id`. |
+| `list_sessions()` | `(user_id: str) → list[dict]` | Returns `[{thread_id, session_name, created_at}]` ordered newest first |
+| `get_session()` | `(thread_id: str, user_id: str) → dict | None` | Returns full row including `messages` JSON. Filters by **both** `thread_id` AND `user_id`. |
+| `update_session_messages()` | `(thread_id: str, user_id: str, messages: list[dict], session_name: str | None) → None` | Serialises messages to JSON and updates the row. Updates `session_name` only if one is provided. |
+
+**Schema:**
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    thread_id   TEXT PRIMARY KEY,
+    session_name TEXT,
+    user_id     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    messages    TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+```
+
+The DB file will be stored at `data/sessions.db` (alongside the existing `data/` directory).
+
+---
+
+### Component 2: Agent Modification
+
+#### [MODIFY] [agent.py](file:///f:/medical-agent/agent/agent.py)
+
+**What changes:**
+- `run_agent()` signature changes from `run_agent(query: str)` to `run_agent(query: str, history: list | None = None)`.
+- When `history` is provided, it prepends the history messages before the new `HumanMessage(content=query)`.
+- When `history` is `None` (default), behavior is identical to today — fully backwards-compatible.
+
+**What stays the same:** The agent definition (`create_react_agent`, `SYSTEM_PROMPT`, `_build_llm`, `get_agent`), tool interception logic, and tool output bypass logic are **completely untouched**.
+
+```diff
+-def run_agent(query: str) -> dict:
++def run_agent(query: str, history: list | None = None) -> dict:
+     agent = get_agent()
+-    result = agent.invoke({"messages": [HumanMessage(content=query)]})
++    messages = list(history) if history else []
++    messages.append(HumanMessage(content=query))
++    result = agent.invoke({"messages": messages})
+```
+
+One new import added: `AIMessage` from `langchain_core.messages` (already partially imported).
+
+---
+
+### Component 3: Route Changes
+
+#### [MODIFY] [routes.py](file:///f:/medical-agent/api/routes.py)
+
+**New schemas:**
+```python
+class ChatRequest(BaseModel):       # MODIFIED — add optional session fields
+    query: str
+    thread_id: str | None = None
+    user_id: str | None = None
+
+class CreateSessionRequest(BaseModel):   # NEW
+    user_id: str
+
+class CreateSessionResponse(BaseModel):  # NEW
+    thread_id: str
+
+class SessionSummary(BaseModel):         # NEW
+    thread_id: str
+    session_name: str | None
+    created_at: str
+
+class SessionDetail(BaseModel):          # NEW
+    thread_id: str
+    session_name: str | None
+    created_at: str
+    messages: list[dict]
+```
+
+**New endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST /api/create_session` | Accepts `{user_id}`, creates session, returns `{thread_id}` |
+| `GET /api/list_sessions` | Query param `user_id`, returns list of `SessionSummary` |
+| `GET /api/get_session` | Query params `thread_id + user_id`, returns `SessionDetail` with full messages |
+
+**Modified endpoint — `POST /api/chat`:**
+
+The existing chat endpoint is extended (not replaced). The flow becomes:
+
+1. If `thread_id` and `user_id` are provided → session-based mode:
+   - Fetch session from DB (validate `user_id` ownership)
+   - Parse stored `messages` JSON → convert each to `HumanMessage` / `AIMessage`
+   - Append new `HumanMessage(content=query)` to the list
+   - Call `run_agent(query, history=converted_history)`
+   - Extract AI response
+   - Append both `{role: "user", content: query}` and `{role: "assistant", content: response}` to the raw messages list
+   - Auto-generate `session_name` from first user message (truncated to 50 chars) if session name is empty/null
+   - Update SQLite
+   - Return `ChatResponse`
+2. If `thread_id` / `user_id` are absent → legacy stateless mode (unchanged behavior)
+
+The `lab-upload` endpoint is **left untouched**.
+
+---
+
+### Component 4: App Startup
+
+#### [MODIFY] [main.py](file:///f:/medical-agent/main.py)
+
+- Import `create_table_if_not_exists` from `api.db`
+- Call it inside the `lifespan()` function (after env validation, before `yield`)
+- One line addition: `create_table_if_not_exists()`
+
+---
+
+### Component 5: Frontend
+
+#### [MODIFY] [index.html](file:///f:/medical-agent/static/index.html)
+
+**Sidebar restructure — the left sidebar currently shows:**
+```
+Logo
+"Available Tools" label
+3 tool cards
+Footer
+```
+
+**New layout:**
+```
+Logo
+[+ New Chat] button 
+"Chat History" label
+Scrollable session list (clickable items)
+────────────────────────
+"Available Tools" label (collapsed section)
+3 tool cards (same as today)
+Footer
+```
+
+**New JavaScript state & functions:**
+
+| Variable | Type | Purpose |
+|---|---|---|
+| `activeThreadId` | `string` | Currently active session thread ID |
+| `currentUserId` | `string` | Hardcoded to `"default_user"` for now (no auth system) |
+
+| Function | Description |
+|---|---|
+| `createSession()` | `POST /api/create_session` → sets `activeThreadId`, clears chat, refreshes sidebar |
+| `loadSessions()` | `GET /api/list_sessions` → renders sidebar list |
+| `loadSession(threadId)` | `GET /api/get_session` → renders all past messages in the chat area |
+| `refreshSidebarAfterFirstMessage()` | Called after first message in a new session to update the session name |
+
+**Modified `sendMessage()`:**
+- Sends `{ query, thread_id: activeThreadId, user_id: currentUserId }` instead of `{ query }`
+- After first message in a new session, calls `loadSessions()` to refresh the sidebar with the auto-generated name
+
+**On page load:**
+1. Call `loadSessions()` to populate sidebar
+2. Auto-call `createSession()` so the user starts with a fresh thread immediately
+
+**Styling:**
+- All new elements follow the existing CSS variables (`--panel`, `--border`, `--accent`, `--bg`, `--muted`, etc.)
+- Session items get a subtle hover effect and active state highlight
+- The "New Chat" button uses the accent color gradient consistent with the logo icon
+- Matching the existing dark theme and font families (`var(--font-head)`, `var(--font-body)`)
+
+---
+
+### Component 6: Dependencies & Config
+
+#### [MODIFY] [.gitignore](file:///f:/medical-agent/.gitignore)
+- Add `*.db` to prevent committing the SQLite database file
+
+#### requirements.txt
+- **No changes needed.** SQLite is part of Python's standard library.
+
+#### .env
+- **No changes needed.** No new environment variables are required.
+
+---
+
+## What Is NOT Changing
+
+| File / Module | Reason |
+|---|---|
+| `agent/agent.py` (agent definition) | `create_react_agent`, `SYSTEM_PROMPT`, `_build_llm`, `get_agent` — all untouched |
+| `agent/tools/*` | All 3 tools (symptoms, drug, lab) — completely untouched |
+| `agent/guardrails/*` | Guardrail logic — untouched |
+| `POST /api/lab-upload` | File upload endpoint — untouched |
+| `tests/*` | Existing tests — untouched (they mock `run_agent` which remains backwards-compatible) |
+| `data/*` | ChromaDB, lab reference, medical docs — untouched |
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **User ID strategy**: Since there is no authentication system, I will hardcode `user_id = "default_user"` in the frontend. All sessions belong to one user. If you want multi-user support later, this can be replaced with a login system — the DB schema already supports it via the `user_id` column.
+
+> [!IMPORTANT]
+> **Database location**: The SQLite file will be created at `data/sessions.db`. This keeps it alongside other data files. Let me know if you prefer a different location.
+
+> [!IMPORTANT]  
+> **Lab upload sessions**: The `POST /api/lab-upload` endpoint will NOT be session-aware in this implementation (it currently bypasses the agent entirely and calls the lab tool directly). Lab upload results will appear in the chat UI but won't be persisted to session history. Let me know if you want this included too.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. Start the server: `uvicorn main:app --reload --port 8000`
+2. Use the browser tool to:
+   - Verify the sidebar shows "New Chat" button + empty session list on first load
+   - Create a new session and verify it appears in the sidebar
+   - Send 2-3 messages and verify they're displayed + sidebar name updates
+   - Click "New Chat", verify a fresh session starts
+   - Click back on the old session, verify all messages are restored
+   - Verify the old session continues correctly with new messages
+
+### Manual Verification
+- After server restart, verify that all sessions + messages persist (SQLite survival test)
+- Verify the `data/sessions.db` file exists after first session creation
